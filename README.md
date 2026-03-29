@@ -106,7 +106,9 @@ python train_last_n_pooling.py \
   --cv-mode sliding \
   --threads 8 \
   --gpu \
-  --target1-sample-frac 0.05 \
+  --target1-sample-frac 1.0 \
+  --hard-negative-mining \
+  --hnm-keep-frac 0.25 \
   --max-epochs 50 \
   --patience 6 \
   --lr 0.0003 \
@@ -118,7 +120,8 @@ python train_last_n_pooling.py \
   --use-future-branches
 ```
 
-Данный скрипт обучает 5 моделей на разных фолдах, а затем создает финальное предсказание.
+Данный скрипт обучает 5 моделей на разных фолдах, а затем создает финальное предсказание. 
+По умолчанию используется полный train (`target1_sample_frac=1.0`) и двухстадийное обучение: базовый этап + hard-negative mining по `target=1` (green) транзакциям.
 
 Время обучения одной модели - около 1 часа на RTX 5090. Соответственно общее время работы скрипта - около 5 часов.
 

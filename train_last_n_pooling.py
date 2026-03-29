@@ -62,6 +62,11 @@ DEFAULT_ONE_HOT_MAX_CARDINALITY = 0  # 0 = disabled
 
 DEFAULT_FUTURE_MAX_HOURS = 24.0
 DEFAULT_FUTURE_BRANCH_WEIGHT = 0.5
+DEFAULT_HARD_NEGATIVE_MINING = True
+DEFAULT_HARD_NEGATIVE_KEEP_FRAC = 0.25
+DEFAULT_HARD_NEGATIVE_MIN_GREEN_KEEP = 20_000
+DEFAULT_HARD_NEGATIVE_MAX_GREEN_KEEP = 500_000
+DEFAULT_HARD_NEGATIVE_PATIENCE = 2
 
 
 BASE_CAT_COLS = [
@@ -355,6 +360,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
     )
+    parser.add_argument(
+        "--hard-negative-mining",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_HARD_NEGATIVE_MINING,
+        help="Run a second-stage fine-tuning pass on mined hard target=1 negatives.",
+    )
+    parser.add_argument(
+        "--hnm-keep-frac",
+        type=float,
+        default=DEFAULT_HARD_NEGATIVE_KEEP_FRAC,
+        help="Fraction of target=1 negatives to keep for hard-negative fine-tuning stage.",
+    )
+    parser.add_argument(
+        "--hnm-min-green-keep",
+        type=int,
+        default=DEFAULT_HARD_NEGATIVE_MIN_GREEN_KEEP,
+        help="Lower cap for number of mined target=1 negatives.",
+    )
+    parser.add_argument(
+        "--hnm-max-green-keep",
+        type=int,
+        default=DEFAULT_HARD_NEGATIVE_MAX_GREEN_KEEP,
+        help="Upper cap for number of mined target=1 negatives.",
+    )
+    parser.add_argument(
+        "--hnm-patience",
+        type=int,
+        default=DEFAULT_HARD_NEGATIVE_PATIENCE,
+        help="Early-stopping patience for hard-negative fine-tuning stage.",
+    )
 
     parser.add_argument(
         "--use-label-history",
@@ -368,6 +403,16 @@ def parse_args() -> argparse.Namespace:
 
     if not (0.0 < args.target1_sample_frac <= 1.0):
         raise ValueError("--target1-sample-frac must be in (0, 1].")
+    if not (0.0 < args.hnm_keep_frac <= 1.0):
+        raise ValueError("--hnm-keep-frac must be in (0, 1].")
+    if args.hnm_min_green_keep < 0:
+        raise ValueError("--hnm-min-green-keep must be >= 0.")
+    if args.hnm_max_green_keep < 1:
+        raise ValueError("--hnm-max-green-keep must be >= 1.")
+    if args.hnm_min_green_keep > args.hnm_max_green_keep:
+        raise ValueError("--hnm-min-green-keep must be <= --hnm-max-green-keep.")
+    if args.hnm_patience <= 0:
+        raise ValueError("--hnm-patience must be > 0.")
     if args.last_n <= 0:
         raise ValueError("--last-n must be > 0.")
     if args.last_n < max(args.history_windows):
@@ -664,6 +709,38 @@ def compute_pos_weight_from_binary(binary_targets: np.ndarray, max_cap: float = 
     if pos <= 0:
         return 1.0
     return float(min(max_cap, max(1.0, neg / pos)))
+
+
+def build_hard_negative_mask(
+    target_raw: np.ndarray,
+    train_mask: np.ndarray,
+    hard_score: np.ndarray,
+    keep_frac: float,
+    min_green_keep: int,
+    max_green_keep: int,
+) -> np.ndarray:
+    if len(target_raw) != len(train_mask) or len(target_raw) != len(hard_score):
+        raise ValueError("target_raw, train_mask and hard_score must have equal lengths.")
+
+    out_mask = train_mask.copy()
+    green_idx = np.flatnonzero(train_mask & (target_raw == 1))
+    if len(green_idx) == 0:
+        return out_mask
+
+    n_keep = int(round(len(green_idx) * keep_frac))
+    n_keep = max(min_green_keep, n_keep)
+    n_keep = min(max_green_keep, n_keep)
+    n_keep = min(len(green_idx), n_keep)
+
+    out_mask[green_idx] = False
+    if n_keep <= 0:
+        return out_mask
+
+    green_scores = hard_score[green_idx].astype(np.float64, copy=False)
+    top_rel = np.argpartition(green_scores, -n_keep)[-n_keep:]
+    keep_idx = green_idx[top_rel]
+    out_mask[keep_idx] = True
+    return out_mask
 
 
 def build_cat_mode_info(
@@ -2252,115 +2329,195 @@ def run_training_job(
     best_state = None
     best_monitor = -1.0
     best_epoch = 0
-    epochs_no_improve = 0
+    best_stage = "base"
     epoch_history = []
+    global_epoch = 0
 
-    for epoch in range(1, epochs + 1):
-        train_stats = train_one_epoch(
+    def run_stage(
+        stage_name: str,
+        stage_train_loader: DataLoader,
+        stage_train_eval_loader: DataLoader,
+        stage_epochs: int,
+        stage_patience: int,
+        stage_use_early_stopping: bool,
+    ) -> None:
+        nonlocal best_state, best_monitor, best_epoch, best_stage, epoch_history, global_epoch
+        epochs_no_improve = 0
+
+        for _ in range(stage_epochs):
+            global_epoch += 1
+            epoch = global_epoch
+            train_stats = train_one_epoch(
+                model=model,
+                loader=stage_train_loader,
+                optimizer=optimizer,
+                pos_weight_red=pos_weight_red,
+                pos_weight_suspicious=pos_weight_suspicious,
+                pos_weight_ry=pos_weight_ry,
+                aux_loss_weight_suspicious=args.aux_loss_weight_suspicious,
+                aux_loss_weight_red_yellow=args.aux_loss_weight_red_yellow,
+                grad_clip=args.grad_clip,
+                device=device,
+            )
+
+            train_final_ap = None
+            train_red_ap = None
+            train_suspicious_ap = None
+            train_ry_ap = None
+
+            if epoch % args.train_ap_every_n_epochs == 0:
+                train_pred_epoch = predict_loader_all(
+                    model=model,
+                    loader=stage_train_eval_loader,
+                    device=device,
+                    use_pred_mask=False,
+                )
+                train_metrics_epoch = compute_ap_metrics(
+                    target_raw=train_pred_epoch["target_raw"],
+                    final_score=train_pred_epoch["final_score"],
+                    red_score=train_pred_epoch["red_score"],
+                    suspicious_score=train_pred_epoch["suspicious_score"],
+                    ry_score=train_pred_epoch["ry_score"],
+                )
+                train_final_ap = train_metrics_epoch["final_ap"]
+                train_red_ap = train_metrics_epoch["red_ap"]
+                train_suspicious_ap = train_metrics_epoch["suspicious_ap"]
+                train_ry_ap = train_metrics_epoch["ry_ap"]
+
+            es_metrics_epoch = None
+            if es_loader is not None:
+                es_pred_epoch = predict_loader_all(
+                    model=model,
+                    loader=es_loader,
+                    device=device,
+                    use_pred_mask=True,
+                )
+                es_metrics_epoch = compute_ap_metrics(
+                    target_raw=es_pred_epoch["target_raw"],
+                    final_score=es_pred_epoch["final_score"],
+                    red_score=es_pred_epoch["red_score"],
+                    suspicious_score=es_pred_epoch["suspicious_score"],
+                    ry_score=es_pred_epoch["ry_score"],
+                )
+
+            epoch_rec = {
+                "stage": stage_name,
+                "epoch": epoch,
+                "train_total_loss": float(train_stats["total_loss"]) if not np.isnan(train_stats["total_loss"]) else None,
+                "train_red_loss": train_stats["red_loss"],
+                "train_suspicious_loss": train_stats["suspicious_loss"],
+                "train_ry_loss": train_stats["ry_loss"],
+                "train_final_ap": train_final_ap,
+                "train_red_ap": train_red_ap,
+                "train_suspicious_ap": train_suspicious_ap,
+                "train_ry_ap": train_ry_ap,
+                "es_final_ap": None if es_metrics_epoch is None else es_metrics_epoch["final_ap"],
+                "es_red_ap": None if es_metrics_epoch is None else es_metrics_epoch["red_ap"],
+                "es_suspicious_ap": None if es_metrics_epoch is None else es_metrics_epoch["suspicious_ap"],
+                "es_ry_ap": None if es_metrics_epoch is None else es_metrics_epoch["ry_ap"],
+            }
+            epoch_history.append(epoch_rec)
+
+            logger.info(
+                "%s | %s | epoch %d | total_loss=%s | red_loss=%s | suspicious_loss=%s | ry_loss=%s | train_final_ap=%s | train_red_ap=%s | train_suspicious_ap=%s | train_ry_ap=%s | es_final_ap=%s | es_red_ap=%s | es_suspicious_ap=%s | es_ry_ap=%s",
+                job_name,
+                stage_name,
+                epoch,
+                fmt_optional(epoch_rec["train_total_loss"]),
+                fmt_optional(epoch_rec["train_red_loss"]),
+                fmt_optional(epoch_rec["train_suspicious_loss"]),
+                fmt_optional(epoch_rec["train_ry_loss"]),
+                "skip" if train_final_ap is None else f"{train_final_ap:.6f}",
+                "skip" if train_red_ap is None else f"{train_red_ap:.6f}",
+                "skip" if train_suspicious_ap is None else f"{train_suspicious_ap:.6f}",
+                "skip" if train_ry_ap is None else f"{train_ry_ap:.6f}",
+                fmt_optional(epoch_rec["es_final_ap"]),
+                fmt_optional(epoch_rec["es_red_ap"]),
+                fmt_optional(epoch_rec["es_suspicious_ap"]),
+                fmt_optional(epoch_rec["es_ry_ap"]),
+            )
+
+            if stage_use_early_stopping and es_metrics_epoch is not None:
+                monitor = -1.0 if es_metrics_epoch["final_ap"] is None else float(es_metrics_epoch["final_ap"])
+                if monitor > best_monitor:
+                    best_monitor = monitor
+                    best_epoch = epoch
+                    best_stage = stage_name
+                    best_state = copy.deepcopy(model.state_dict())
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+
+                if epochs_no_improve >= stage_patience:
+                    logger.info("%s | %s | early stopping at epoch %d by final AP", job_name, stage_name, epoch)
+                    break
+
+    run_stage(
+        stage_name="base",
+        stage_train_loader=train_loader,
+        stage_train_eval_loader=train_eval_loader,
+        stage_epochs=epochs,
+        stage_patience=args.patience,
+        stage_use_early_stopping=use_early_stopping and (es_loader is not None),
+    )
+
+    hnm_used = False
+    hnm_train_mask_rows = 0
+    hnm_train_segments = 0
+    if bool(args.hard_negative_mining):
+        train_pred_for_hnm = predict_loader_all(
             model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            pos_weight_red=pos_weight_red,
-            pos_weight_suspicious=pos_weight_suspicious,
-            pos_weight_ry=pos_weight_ry,
-            aux_loss_weight_suspicious=args.aux_loss_weight_suspicious,
-            aux_loss_weight_red_yellow=args.aux_loss_weight_red_yellow,
-            grad_clip=args.grad_clip,
+            loader=train_eval_loader,
             device=device,
+            use_pred_mask=False,
         )
+        train_score_full = np.zeros(len(store.target_raw), dtype=np.float32)
+        train_score_full[train_pred_for_hnm["idx"]] = train_pred_for_hnm["final_score"]
 
-        train_final_ap = None
-        train_red_ap = None
-        train_suspicious_ap = None
-        train_ry_ap = None
-
-        if epoch % args.train_ap_every_n_epochs == 0:
-            train_pred_epoch = predict_loader_all(
-                model=model,
-                loader=train_eval_loader,
-                device=device,
-                use_pred_mask=False,
-            )
-            train_metrics_epoch = compute_ap_metrics(
-                target_raw=train_pred_epoch["target_raw"],
-                final_score=train_pred_epoch["final_score"],
-                red_score=train_pred_epoch["red_score"],
-                suspicious_score=train_pred_epoch["suspicious_score"],
-                ry_score=train_pred_epoch["ry_score"],
-            )
-            train_final_ap = train_metrics_epoch["final_ap"]
-            train_red_ap = train_metrics_epoch["red_ap"]
-            train_suspicious_ap = train_metrics_epoch["suspicious_ap"]
-            train_ry_ap = train_metrics_epoch["ry_ap"]
-
-        es_metrics_epoch = None
-        if es_loader is not None:
-            es_pred_epoch = predict_loader_all(
-                model=model,
-                loader=es_loader,
-                device=device,
-                use_pred_mask=True,
-            )
-            es_metrics_epoch = compute_ap_metrics(
-                target_raw=es_pred_epoch["target_raw"],
-                final_score=es_pred_epoch["final_score"],
-                red_score=es_pred_epoch["red_score"],
-                suspicious_score=es_pred_epoch["suspicious_score"],
-                ry_score=es_pred_epoch["ry_score"],
-            )
-
-        epoch_rec = {
-            "epoch": epoch,
-            "train_total_loss": float(train_stats["total_loss"]) if not np.isnan(train_stats["total_loss"]) else None,
-            "train_red_loss": train_stats["red_loss"],
-            "train_suspicious_loss": train_stats["suspicious_loss"],
-            "train_ry_loss": train_stats["ry_loss"],
-            "train_final_ap": train_final_ap,
-            "train_red_ap": train_red_ap,
-            "train_suspicious_ap": train_suspicious_ap,
-            "train_ry_ap": train_ry_ap,
-            "es_final_ap": None if es_metrics_epoch is None else es_metrics_epoch["final_ap"],
-            "es_red_ap": None if es_metrics_epoch is None else es_metrics_epoch["red_ap"],
-            "es_suspicious_ap": None if es_metrics_epoch is None else es_metrics_epoch["suspicious_ap"],
-            "es_ry_ap": None if es_metrics_epoch is None else es_metrics_epoch["ry_ap"],
-        }
-        epoch_history.append(epoch_rec)
-
-        logger.info(
-            "%s | epoch %d | total_loss=%s | red_loss=%s | suspicious_loss=%s | ry_loss=%s | train_final_ap=%s | train_red_ap=%s | train_suspicious_ap=%s | train_ry_ap=%s | es_final_ap=%s | es_red_ap=%s | es_suspicious_ap=%s | es_ry_ap=%s",
-            job_name,
-            epoch,
-            fmt_optional(epoch_rec["train_total_loss"]),
-            fmt_optional(epoch_rec["train_red_loss"]),
-            fmt_optional(epoch_rec["train_suspicious_loss"]),
-            fmt_optional(epoch_rec["train_ry_loss"]),
-            "skip" if train_final_ap is None else f"{train_final_ap:.6f}",
-            "skip" if train_red_ap is None else f"{train_red_ap:.6f}",
-            "skip" if train_suspicious_ap is None else f"{train_suspicious_ap:.6f}",
-            "skip" if train_ry_ap is None else f"{train_ry_ap:.6f}",
-            fmt_optional(epoch_rec["es_final_ap"]),
-            fmt_optional(epoch_rec["es_red_ap"]),
-            fmt_optional(epoch_rec["es_suspicious_ap"]),
-            fmt_optional(epoch_rec["es_ry_ap"]),
+        hnm_mask = build_hard_negative_mask(
+            target_raw=store.target_raw,
+            train_mask=train_mask,
+            hard_score=train_score_full,
+            keep_frac=float(args.hnm_keep_frac),
+            min_green_keep=int(args.hnm_min_green_keep),
+            max_green_keep=int(args.hnm_max_green_keep),
         )
+        hnm_segments = filter_segments_by_target_mask(segments, hnm_mask)
+        hnm_train_mask_rows = int(hnm_mask.sum())
+        hnm_train_segments = int(len(hnm_segments))
 
-        if use_early_stopping and es_metrics_epoch is not None:
-            monitor = -1.0 if es_metrics_epoch["final_ap"] is None else float(es_metrics_epoch["final_ap"])
-            if monitor > best_monitor:
-                best_monitor = monitor
-                best_epoch = epoch
-                best_state = copy.deepcopy(model.state_dict())
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-
-            if epochs_no_improve >= args.patience:
-                logger.info("%s | early stopping at epoch %d by final AP", job_name, epoch)
-                break
+        if hnm_train_segments > 0:
+            hnm_used = True
+            hnm_dataset = SequenceSegmentDataset(
+                store=store,
+                segments=hnm_segments,
+                row_train_mask=hnm_mask,
+                row_pred_mask=np.zeros_like(hnm_mask, dtype=bool),
+                row_future_visible_mask=train_future_visible_mask,
+            )
+            hnm_loader = make_loader(hnm_dataset, batch_size=batch_size, shuffle=True, device=device)
+            hnm_eval_loader = make_loader(hnm_dataset, batch_size=batch_size, shuffle=False, device=device)
+            logger.info(
+                "%s | hard-negative mining | hnm_rows=%d hnm_segments=%d green_kept=%d/%d",
+                job_name,
+                hnm_train_mask_rows,
+                hnm_train_segments,
+                int(np.sum(hnm_mask & (store.target_raw == 1))),
+                int(np.sum(train_mask & (store.target_raw == 1))),
+            )
+            run_stage(
+                stage_name="hnm",
+                stage_train_loader=hnm_loader,
+                stage_train_eval_loader=hnm_eval_loader,
+                stage_epochs=max(1, int(args.patience)),
+                stage_patience=args.hnm_patience,
+                stage_use_early_stopping=use_early_stopping and (es_loader is not None),
+            )
 
     if best_state is None:
         best_state = copy.deepcopy(model.state_dict())
         best_epoch = max(1, len(epoch_history))
+        best_stage = "base"
         best_monitor = float("nan")
 
     model.load_state_dict(best_state)
@@ -2442,6 +2599,7 @@ def run_training_job(
             **checkpoint_extra_metadata,
             "training_summary": {
                 "best_epoch": int(best_epoch),
+                "best_stage": str(best_stage),
                 "best_monitor_value": None if np.isnan(best_monitor) else float(best_monitor),
                 "train_metrics": train_metrics_best,
                 "eval_metrics": eval_metrics_best,
@@ -2450,12 +2608,23 @@ def run_training_job(
                 "pos_weight_red": float(pos_weight_red),
                 "pos_weight_suspicious": float(pos_weight_suspicious),
                 "pos_weight_ry": float(pos_weight_ry),
+                "hard_negative_mining": {
+                    "enabled": bool(args.hard_negative_mining),
+                    "used": bool(hnm_used),
+                    "keep_frac": float(args.hnm_keep_frac),
+                    "min_green_keep": int(args.hnm_min_green_keep),
+                    "max_green_keep": int(args.hnm_max_green_keep),
+                    "patience": int(args.hnm_patience),
+                    "hnm_train_mask_rows": int(hnm_train_mask_rows),
+                    "hnm_train_segments": int(hnm_train_segments),
+                },
             },
         },
     )
 
     job_info = {
         "best_epoch": int(best_epoch),
+        "best_stage": str(best_stage),
         "best_monitor_value": None if np.isnan(best_monitor) else float(best_monitor),
         "train_metrics": train_metrics_best,
         "eval_metrics": eval_metrics_best,
@@ -2468,6 +2637,16 @@ def run_training_job(
         "train_segments": int(len(train_segments)),
         "eval_segments": int(len(eval_segments)),
         "es_segments": int(len(es_segments)) if es_mask is not None else 0,
+        "hard_negative_mining": {
+            "enabled": bool(args.hard_negative_mining),
+            "used": bool(hnm_used),
+            "keep_frac": float(args.hnm_keep_frac),
+            "min_green_keep": int(args.hnm_min_green_keep),
+            "max_green_keep": int(args.hnm_max_green_keep),
+            "patience": int(args.hnm_patience),
+            "hnm_train_mask_rows": int(hnm_train_mask_rows),
+            "hnm_train_segments": int(hnm_train_segments),
+        },
     }
 
     return model, job_info, eval_pred_best
@@ -2510,6 +2689,15 @@ def main():
     logger.info("Future max hours: %.4f", args.future_max_hours)
     logger.info("Future branch weight: %.4f", args.future_branch_weight)
     logger.info("Use label history: %s", args.use_label_history)
+    logger.info(
+        "Sampling/HNM | target1_sample_frac=%.4f hard_negative_mining=%s keep_frac=%.4f min_green_keep=%d max_green_keep=%d hnm_patience=%d",
+        args.target1_sample_frac,
+        args.hard_negative_mining,
+        args.hnm_keep_frac,
+        args.hnm_min_green_keep,
+        args.hnm_max_green_keep,
+        args.hnm_patience,
+    )
     logger.info(
         "Multitask config | aux_suspicious=%.4f aux_ry=%.4f inference_blend=%.4f",
         args.aux_loss_weight_suspicious,
@@ -2768,7 +2956,9 @@ def main():
             "pos_weight_ry": job_info["pos_weight_ry"],
 
             "best_epoch": job_info["best_epoch"],
+            "best_stage": job_info["best_stage"],
             "best_es_final_ap_during_training": job_info["best_monitor_value"],
+            "hard_negative_mining": job_info["hard_negative_mining"],
 
             "recalculated_train_final_ap": job_info["train_metrics"]["final_ap"],
             "recalculated_train_red_ap": job_info["train_metrics"]["red_ap"],
@@ -3011,6 +3201,7 @@ def main():
     fold_summary_keys = [
         "fold_idx",
         "best_epoch",
+        "best_stage",
         "best_es_final_ap_during_training",
         "recalculated_train_final_ap",
         "recalculated_train_red_ap",
@@ -3066,7 +3257,16 @@ def main():
 
         "sampling": {
             "target1_sample_frac": float(args.target1_sample_frac),
-            "description": "Applied to dataset=1,target=1 rows in fold train, ES subset and final-model training.",
+            "description": "Applied to dataset=1,target=1 rows in fold train, ES subset and final-model training; use 1.0 to train on full data.",
+        },
+
+        "hard_negative_mining": {
+            "enabled": bool(args.hard_negative_mining),
+            "keep_frac": float(args.hnm_keep_frac),
+            "min_green_keep": int(args.hnm_min_green_keep),
+            "max_green_keep": int(args.hnm_max_green_keep),
+            "patience": int(args.hnm_patience),
+            "description": "Second-stage fine-tuning keeps hardest target=1 negatives by model score while preserving all non-green labels.",
         },
 
         "monitoring": {
